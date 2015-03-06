@@ -18,21 +18,31 @@ package com.spotify.folsom;
 
 import com.google.common.base.Charsets;
 import com.google.common.net.HostAndPort;
+import com.google.common.util.concurrent.ListenableFuture;
+
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
 public class MisbehavingServerTest {
+
+  private static final Logger log = LoggerFactory.getLogger(MisbehavingServerTest.class);
+
   private Server server;
 
   @Before
@@ -183,13 +193,76 @@ public class MisbehavingServerTest {
 
   private MemcacheClient<String> setupAscii(String response) throws Exception {
     server = new Server(response);
+    return createClient(server, 100L, 100);
+  }
+
+  private MemcacheClient<String> createClient(Server server, long timeoutMillis, int maxOutstanding) throws Exception {
     MemcacheClient<String> client = MemcacheClientBuilder.newStringClient()
             .withAddress(HostAndPort.fromParts("localhost", server.port))
-            .withRequestTimeoutMillis(100L)
+            .withMaxOutstandingRequests(maxOutstanding)
+            .withRequestTimeoutMillis(timeoutMillis)
             .withRetry(false)
             .connectAscii();
     ConnectFuture.connectFuture(client).get();
     return client;
+  }
+
+  @Test
+  public void testServerGoesAway() throws Throwable {
+    server = new Server("VALUE key 0 2\r\nOK\r\nEND\r\n");
+
+    final int maxOutstanding = 100;
+    MemcacheClient<String> client = createClient(server, 1000L, maxOutstanding);
+
+    // test Ok
+    assertEquals("OK", client.get("key").get());
+
+    // have the server stop sending responses
+    server.setActive(false);
+
+    // send enough additional requests to fill up the outstanding queue
+    for (int i = 0; i < maxOutstanding; i++) {
+      ListenableFuture<String> future = client.get("key");
+      assertFalse(future.isDone());
+    }
+
+    // re-enable the server, and pause to let the outstanding requests all "expire"
+    server.setActive(true);
+    Thread.sleep(1500);
+
+    assertEquals(1, client.numActiveConnections());
+
+    // send a bunch more requests, expecting them to succeed since the previous requests should have timed out
+    int successes = 0;
+    int tooManyOutstanding = 0;
+    int otherFailures = 0;
+    List<ListenableFuture<String>> futures = new ArrayList<>();
+    for (int i = 0; i < 10; i++) {
+      futures.add(client.get("key"));
+    }
+
+    // sleep some more to give the original outstanding requests another chance to expire
+    Thread.sleep(3000);
+    for (int i = 0; i < 10; i++) {
+      futures.add(client.get("key"));
+    }
+
+    for (ListenableFuture<String> f : futures) {
+      try {
+        f.get();
+        successes++;
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof MemcacheOverloadedException) {
+          tooManyOutstanding++;
+        } else {
+          otherFailures++;
+        }
+      }
+    }
+
+    log.info("successes={}, tooManyOutstanding={}, otherFailures={}", successes, tooManyOutstanding, otherFailures);
+    assertEquals(0, tooManyOutstanding);
+    assertEquals(20, successes);
   }
 
   private static class Server {
@@ -199,6 +272,7 @@ public class MisbehavingServerTest {
 
     private volatile Throwable failure;
     private volatile Socket socket;
+    private volatile boolean active = true;
 
     private Server(String responseString) throws IOException {
       final byte[] response = responseString.getBytes(Charsets.UTF_8);
@@ -209,7 +283,9 @@ public class MisbehavingServerTest {
         public void run() {
           try {
             socket = serverSocket.accept();
-            handleConnection(socket);
+            if (active) {
+              handleConnection(socket);
+            }
           } catch (Throwable e) {
             failure = e;
             failure.printStackTrace();
@@ -232,6 +308,10 @@ public class MisbehavingServerTest {
         }
       });
       thread.start();
+    }
+
+    public void setActive(boolean active) {
+      this.active = active;
     }
 
     public void stop() throws Exception {
